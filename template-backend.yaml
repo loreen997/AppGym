@@ -132,7 +132,7 @@ Resources:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt GymUserPool.Arn
 
-  ########################
+   ########################
   # USERS Lambda
   ########################
 
@@ -141,8 +141,12 @@ Resources:
     Properties:
       Handler: index.handler
       InlineCode: |
-        const AWS = require("aws-sdk");
-        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+        const { DynamoDBDocumentClient, GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
+
+        const client = new DynamoDBClient({});
+        const dynamo = DynamoDBDocumentClient.from(client);
+
         const USERS_TABLE = process.env.USERS_TABLE;
 
         const json = (statusCode, body) => ({
@@ -157,45 +161,47 @@ Resources:
 
             if (method === "GET") {
               const userId = event.requestContext.authorizer.claims.sub;
-              if (!userId) return json(400, { error: "Missing userId" });
+              if (!userId)
+                return json(400, { error: "Missing userId" });
 
-              const res = await dynamo.get({
+              const res = await dynamo.send(new GetCommand({
                 TableName: USERS_TABLE,
-                Key: { userId },
-              }).promise();
+                Key: { userId }
+              }));
 
               return json(200, res.Item || null);
             }
 
             if (method === "POST") {
+              const userId = event.requestContext.authorizer.claims.sub;
+              const body = event.body ? JSON.parse(event.body) : {};
+              const { name, surname, email, phone } = body;
 
-            const userId = event.requestContext.authorizer.claims.sub;
-            const body = event.body ? JSON.parse(event.body) : {};
-            const { name, surname, email, phone } = body;
+              if (!email)
+                return json(400, { error: "Missing email" });
 
-            if (!email) return json(400, { error: "Missing email" });
+              const item = {
+                userId,
+                name: name || "",
+                surname: surname || "",
+                email,
+                phone: phone || "",
+                updatedAt: new Date().toISOString(),
+              };
 
-            const item = {
-              userId,
-              name: name || "",
-              surname: surname || "",
-              email,
-              phone: phone || "",
-              updatedAt: new Date().toISOString(),
-            };
+              await dynamo.send(new PutCommand({
+                TableName: USERS_TABLE,
+                Item: item
+              }));
 
-            await dynamo.put({
-              TableName: USERS_TABLE,
-              Item: item
-            }).promise();
-
-            return json(200, item);
-          }
+              return json(200, item);
+            }
 
             return json(405, { error: "Method not allowed" });
+
           } catch (e) {
             console.error(e);
-            return json(500, { error: "Internal error" });
+            return json(500, { error: "Internal error", details: e.message });
           }
         };
       Environment:
