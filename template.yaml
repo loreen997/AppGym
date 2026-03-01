@@ -1,0 +1,494 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Gym Backend (CloudFormation/SAM) - Demo Ready, no build step (inline lambdas)
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 10
+    MemorySize: 256
+
+Resources:
+
+  ########################
+  # DynamoDB
+  ########################
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GymUsers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  ClassesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GymClasses
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: classId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: classId
+          KeyType: HASH
+
+  EnrollmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GymEnrollments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: classId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: classId
+          KeyType: HASH
+        - AttributeName: userId
+          KeyType: RANGE
+
+  ProgramsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GymPrograms
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  MembershipTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GymMembership
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  ########################
+  # API Gateway
+  ########################
+
+  GymApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref StageName
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  ########################
+  # USERS Lambda
+  ########################
+
+  UsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      InlineCode: |
+        const AWS = require("aws-sdk");
+        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const USERS_TABLE = process.env.USERS_TABLE;
+
+        const json = (statusCode, body) => ({
+          statusCode,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        exports.handler = async (event) => {
+          try {
+            const method = event.httpMethod;
+
+            if (method === "GET") {
+              const userId = event.queryStringParameters?.userId;
+              if (!userId) return json(400, { error: "Missing userId" });
+
+              const res = await dynamo.get({
+                TableName: USERS_TABLE,
+                Key: { userId },
+              }).promise();
+
+              return json(200, res.Item || null);
+            }
+
+            if (method === "POST") {
+              const body = event.body ? JSON.parse(event.body) : {};
+              const { userId, name, surname, email, phone } = body;
+
+              if (!userId || !email) return json(400, { error: "Missing userId or email" });
+
+              const item = {
+                userId,
+                name: name || "",
+                surname: surname || "",
+                email,
+                phone: phone || "",
+                updatedAt: new Date().toISOString(),
+              };
+
+              await dynamo.put({ TableName: USERS_TABLE, Item: item }).promise();
+              return json(200, item);
+            }
+
+            return json(405, { error: "Method not allowed" });
+          } catch (e) {
+            console.error(e);
+            return json(500, { error: "Internal error" });
+          }
+        };
+      Environment:
+        Variables:
+          USERS_TABLE: !Ref UsersTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        UsersGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /users
+            Method: GET
+        UsersPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /users
+            Method: POST
+
+  ########################
+  # CLASSES + ENROLL Lambda
+  ########################
+
+  ClassesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      InlineCode: |
+        const AWS = require("aws-sdk");
+        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const CLASSES_TABLE = process.env.CLASSES_TABLE;
+        const ENROLLMENTS_TABLE = process.env.ENROLLMENTS_TABLE;
+
+        const json = (statusCode, body) => ({
+          statusCode,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        exports.handler = async (event) => {
+          try {
+            const method = event.httpMethod;
+            const path = event.path || "";
+
+            // GET /classes
+            if (method === "GET" && path.endsWith("/classes")) {
+              const res = await dynamo.scan({ TableName: CLASSES_TABLE }).promise();
+              return json(200, res.Items || []);
+            }
+
+            // POST /classes (crear clase demo)
+            if (method === "POST" && path.endsWith("/classes")) {
+              const body = event.body ? JSON.parse(event.body) : {};
+              const { classId, name, dateTime, capacity } = body;
+              if (!classId || !name || !dateTime) return json(400, { error: "Missing classId/name/dateTime" });
+
+              const item = {
+                classId,
+                name,
+                dateTime,
+                capacity: Number.isFinite(capacity) ? capacity : 20,
+                enrolledCount: 0,
+              };
+
+              await dynamo.put({ TableName: CLASSES_TABLE, Item: item }).promise();
+              return json(200, item);
+            }
+
+            // POST /classes/enroll
+            if (method === "POST" && path.endsWith("/classes/enroll")) {
+              const body = event.body ? JSON.parse(event.body) : {};
+              const { classId, userId } = body;
+              if (!classId || !userId) return json(400, { error: "Missing classId/userId" });
+
+              const cls = await dynamo.get({ TableName: CLASSES_TABLE, Key: { classId } }).promise();
+              if (!cls.Item) return json(404, { error: "Class not found" });
+
+              const capacity = cls.Item.capacity ?? 20;
+
+              await dynamo.transactWrite({
+                TransactItems: [
+                  {
+                    Put: {
+                      TableName: ENROLLMENTS_TABLE,
+                      Item: { classId, userId, createdAt: new Date().toISOString() },
+                      ConditionExpression: "attribute_not_exists(classId) AND attribute_not_exists(userId)",
+                    },
+                  },
+                  {
+                    Update: {
+                      TableName: CLASSES_TABLE,
+                      Key: { classId },
+                      UpdateExpression: "SET enrolledCount = if_not_exists(enrolledCount, :z) + :o",
+                      ConditionExpression: "if_not_exists(enrolledCount, :z) < :cap",
+                      ExpressionAttributeValues: { ":o": 1, ":z": 0, ":cap": capacity },
+                    },
+                  },
+                ],
+              }).promise();
+
+              return json(200, { ok: true });
+            }
+
+            // DELETE /classes/enroll?classId=...&userId=...
+            if (method === "DELETE" && path.endsWith("/classes/enroll")) {
+              const qs = event.queryStringParameters || {};
+              const classId = qs.classId;
+              const userId = qs.userId;
+              if (!classId || !userId) return json(400, { error: "Missing classId/userId" });
+
+              await dynamo.transactWrite({
+                TransactItems: [
+                  {
+                    Delete: {
+                      TableName: ENROLLMENTS_TABLE,
+                      Key: { classId, userId },
+                      ConditionExpression: "attribute_exists(classId) AND attribute_exists(userId)",
+                    },
+                  },
+                  {
+                    Update: {
+                      TableName: CLASSES_TABLE,
+                      Key: { classId },
+                      UpdateExpression: "SET enrolledCount = if_not_exists(enrolledCount, :z) - :o",
+                      ConditionExpression: "if_not_exists(enrolledCount, :z) > :z",
+                      ExpressionAttributeValues: { ":o": 1, ":z": 0 },
+                    },
+                  },
+                ],
+              }).promise();
+
+              return json(200, { ok: true });
+            }
+
+            return json(404, { error: "Not found" });
+          } catch (e) {
+            console.error(e);
+            return json(400, { error: "Request failed", details: e.message });
+          }
+        };
+      Environment:
+        Variables:
+          CLASSES_TABLE: !Ref ClassesTable
+          ENROLLMENTS_TABLE: !Ref EnrollmentsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClassesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EnrollmentsTable
+      Events:
+        ClassesGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes
+            Method: GET
+        ClassesPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes
+            Method: POST
+        EnrollPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes/enroll
+            Method: POST
+        EnrollDelete:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes/enroll
+            Method: DELETE
+
+  ########################
+  # PROGRAMS Lambda
+  ########################
+
+  ProgramsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      InlineCode: |
+        const AWS = require("aws-sdk");
+        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const crypto = require("crypto");
+        const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE;
+
+        const json = (statusCode, body) => ({
+          statusCode,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        exports.handler = async (event) => {
+          try {
+            const method = event.httpMethod;
+            const path = event.path || "";
+
+            // GET /program?userId=...
+            if (method === "GET" && path.endsWith("/program")) {
+              const userId = event.queryStringParameters?.userId;
+              if (!userId) return json(400, { error: "Missing userId" });
+
+              const res = await dynamo.get({ TableName: PROGRAMS_TABLE, Key: { userId } }).promise();
+              return json(200, res.Item || null);
+            }
+
+            // POST /program/generate  { userId, inputs... }
+            if (method === "POST" && path.endsWith("/program/generate")) {
+              const body = event.body ? JSON.parse(event.body) : {};
+              const userId = body.userId;
+              if (!userId) return json(400, { error: "Missing userId" });
+
+              const program = {
+                id: crypto.randomUUID(),
+                createdAt: new Date().toISOString(),
+                inputs: body.inputs || {},
+                days: [
+                  { day: "Lunes", exercises: [{ name: "Press banca", sets: 4, reps: "8-10" }] },
+                  { day: "Miércoles", exercises: [{ name: "Sentadilla", sets: 4, reps: "8-10" }] },
+                ],
+              };
+
+              const item = { userId, program };
+              await dynamo.put({ TableName: PROGRAMS_TABLE, Item: item }).promise();
+              return json(200, item);
+            }
+
+            return json(404, { error: "Not found" });
+          } catch (e) {
+            console.error(e);
+            return json(500, { error: "Internal error" });
+          }
+        };
+      Environment:
+        Variables:
+          PROGRAMS_TABLE: !Ref ProgramsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProgramsTable
+      Events:
+        ProgramGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /program
+            Method: GET
+        ProgramGenerate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /program/generate
+            Method: POST
+
+  ########################
+  # MEMBERSHIP Lambda
+  ########################
+
+  MembershipFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      InlineCode: |
+        const AWS = require("aws-sdk");
+        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const MEMBERSHIP_TABLE = process.env.MEMBERSHIP_TABLE;
+
+        const json = (statusCode, body) => ({
+          statusCode,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        exports.handler = async (event) => {
+          try {
+            const method = event.httpMethod;
+
+            // GET /membership?userId=...
+            if (method === "GET") {
+              const userId = event.queryStringParameters?.userId;
+              if (!userId) return json(400, { error: "Missing userId" });
+
+              const res = await dynamo.get({ TableName: MEMBERSHIP_TABLE, Key: { userId } }).promise();
+              return json(200, res.Item || null);
+            }
+
+            // POST /membership { userId, status, paidUntil }
+            if (method === "POST") {
+              const body = event.body ? JSON.parse(event.body) : {};
+              const { userId, status, paidUntil } = body;
+              if (!userId || !status) return json(400, { error: "Missing userId/status" });
+
+              const item = {
+                userId,
+                status,
+                paidUntil: paidUntil || null,
+                updatedAt: new Date().toISOString(),
+              };
+
+              await dynamo.put({ TableName: MEMBERSHIP_TABLE, Item: item }).promise();
+              return json(200, item);
+            }
+
+            return json(405, { error: "Method not allowed" });
+          } catch (e) {
+            console.error(e);
+            return json(500, { error: "Internal error" });
+          }
+        };
+      Environment:
+        Variables:
+          MEMBERSHIP_TABLE: !Ref MembershipTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MembershipTable
+      Events:
+        MembershipGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /membership
+            Method: GET
+        MembershipPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /membership
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Description: Base URL
+    Value: !Sub "https://${GymApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
