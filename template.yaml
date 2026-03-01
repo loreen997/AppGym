@@ -168,23 +168,29 @@ Resources:
             }
 
             if (method === "POST") {
-              const body = event.body ? JSON.parse(event.body) : {};
-              const { userId, name, surname, email, phone } = body;
 
-              if (!userId || !email) return json(400, { error: "Missing userId or email" });
+            const userId = event.requestContext.authorizer.claims.sub;
+            const body = event.body ? JSON.parse(event.body) : {};
+            const { name, surname, email, phone } = body;
 
-              const item = {
-                userId,
-                name: name || "",
-                surname: surname || "",
-                email,
-                phone: phone || "",
-                updatedAt: new Date().toISOString(),
-              };
+            if (!email) return json(400, { error: "Missing email" });
 
-              await dynamo.put({ TableName: USERS_TABLE, Item: item }).promise();
-              return json(200, item);
-            }
+            const item = {
+              userId,
+              name: name || "",
+              surname: surname || "",
+              email,
+              phone: phone || "",
+              updatedAt: new Date().toISOString(),
+            };
+
+            await dynamo.put({
+              TableName: USERS_TABLE,
+              Item: item
+            }).promise();
+
+            return json(200, item);
+          }
 
             return json(405, { error: "Method not allowed" });
           } catch (e) {
