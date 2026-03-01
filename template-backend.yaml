@@ -9,7 +9,7 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: nodejs20.x
+    Runtime: nodejs16.x
     Timeout: 10
     MemorySize: 256
 
