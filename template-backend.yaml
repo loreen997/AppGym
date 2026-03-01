@@ -218,7 +218,7 @@ Resources:
             Path: /users
             Method: POST
 
-  ########################
+    ########################
   # CLASSES + ENROLL Lambda
   ########################
 
@@ -227,8 +227,12 @@ Resources:
     Properties:
       Handler: index.handler
       InlineCode: |
-        const AWS = require("aws-sdk");
-        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+        const { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, UpdateCommand, TransactWriteCommand } = require("@aws-sdk/lib-dynamodb");
+
+        const client = new DynamoDBClient({});
+        const dynamo = DynamoDBDocumentClient.from(client);
+
         const CLASSES_TABLE = process.env.CLASSES_TABLE;
         const ENROLLMENTS_TABLE = process.env.ENROLLMENTS_TABLE;
 
@@ -243,17 +247,16 @@ Resources:
             const method = event.httpMethod;
             const path = event.path || "";
 
-            // GET /classes
             if (method === "GET" && path.endsWith("/classes")) {
-              const res = await dynamo.scan({ TableName: CLASSES_TABLE }).promise();
+              const res = await dynamo.send(new ScanCommand({ TableName: CLASSES_TABLE }));
               return json(200, res.Items || []);
             }
 
-            // POST /classes (crear clase demo)
             if (method === "POST" && path.endsWith("/classes")) {
               const body = event.body ? JSON.parse(event.body) : {};
               const { classId, name, dateTime, capacity } = body;
-              if (!classId || !name || !dateTime) return json(400, { error: "Missing classId/name/dateTime" });
+              if (!classId || !name || !dateTime)
+                return json(400, { error: "Missing classId/name/dateTime" });
 
               const item = {
                 classId,
@@ -263,22 +266,31 @@ Resources:
                 enrolledCount: 0,
               };
 
-              await dynamo.put({ TableName: CLASSES_TABLE, Item: item }).promise();
+              await dynamo.send(new PutCommand({
+                TableName: CLASSES_TABLE,
+                Item: item
+              }));
+
               return json(200, item);
             }
 
-            // POST /classes/enroll
             if (method === "POST" && path.endsWith("/classes/enroll")) {
               const body = event.body ? JSON.parse(event.body) : {};
               const { classId, userId } = body;
-              if (!classId || !userId) return json(400, { error: "Missing classId/userId" });
+              if (!classId || !userId)
+                return json(400, { error: "Missing classId/userId" });
 
-              const cls = await dynamo.get({ TableName: CLASSES_TABLE, Key: { classId } }).promise();
-              if (!cls.Item) return json(404, { error: "Class not found" });
+              const cls = await dynamo.send(new GetCommand({
+                TableName: CLASSES_TABLE,
+                Key: { classId }
+              }));
+
+              if (!cls.Item)
+                return json(404, { error: "Class not found" });
 
               const capacity = cls.Item.capacity ?? 20;
 
-              await dynamo.transactWrite({
+              await dynamo.send(new TransactWriteCommand({
                 TransactItems: [
                   {
                     Put: {
@@ -297,19 +309,19 @@ Resources:
                     },
                   },
                 ],
-              }).promise();
+              }));
 
               return json(200, { ok: true });
             }
 
-            // DELETE /classes/enroll?classId=...&userId=...
             if (method === "DELETE" && path.endsWith("/classes/enroll")) {
               const qs = event.queryStringParameters || {};
-              const classId = qs.classId;
-              const userId = qs.userId;
-              if (!classId || !userId) return json(400, { error: "Missing classId/userId" });
+              const { classId, userId } = qs;
 
-              await dynamo.transactWrite({
+              if (!classId || !userId)
+                return json(400, { error: "Missing classId/userId" });
+
+              await dynamo.send(new TransactWriteCommand({
                 TransactItems: [
                   {
                     Delete: {
@@ -328,12 +340,13 @@ Resources:
                     },
                   },
                 ],
-              }).promise();
+              }));
 
               return json(200, { ok: true });
             }
 
             return json(404, { error: "Not found" });
+
           } catch (e) {
             console.error(e);
             return json(400, { error: "Request failed", details: e.message });
@@ -348,33 +361,8 @@ Resources:
             TableName: !Ref ClassesTable
         - DynamoDBCrudPolicy:
             TableName: !Ref EnrollmentsTable
-      Events:
-        ClassesGet:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /classes
-            Method: GET
-        ClassesPost:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /classes
-            Method: POST
-        EnrollPost:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /classes/enroll
-            Method: POST
-        EnrollDelete:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /classes/enroll
-            Method: DELETE
 
-  ########################
+    ########################
   # PROGRAMS Lambda
   ########################
 
@@ -383,9 +371,13 @@ Resources:
     Properties:
       Handler: index.handler
       InlineCode: |
-        const AWS = require("aws-sdk");
-        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+        const { DynamoDBDocumentClient, GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
         const crypto = require("crypto");
+
+        const client = new DynamoDBClient({});
+        const dynamo = DynamoDBDocumentClient.from(client);
+
         const PROGRAMS_TABLE = process.env.PROGRAMS_TABLE;
 
         const json = (statusCode, body) => ({
@@ -399,20 +391,24 @@ Resources:
             const method = event.httpMethod;
             const path = event.path || "";
 
-            // GET /program?userId=...
             if (method === "GET" && path.endsWith("/program")) {
               const userId = event.requestContext.authorizer.claims.sub;
-              if (!userId) return json(400, { error: "Missing userId" });
+              if (!userId)
+                return json(400, { error: "Missing userId" });
 
-              const res = await dynamo.get({ TableName: PROGRAMS_TABLE, Key: { userId } }).promise();
+              const res = await dynamo.send(new GetCommand({
+                TableName: PROGRAMS_TABLE,
+                Key: { userId }
+              }));
+
               return json(200, res.Item || null);
             }
 
-            // POST /program/generate  { userId, inputs... }
             if (method === "POST" && path.endsWith("/program/generate")) {
               const body = event.body ? JSON.parse(event.body) : {};
               const userId = event.requestContext.authorizer.claims.sub;
-              if (!userId) return json(400, { error: "Missing userId" });
+              if (!userId)
+                return json(400, { error: "Missing userId" });
 
               const program = {
                 id: crypto.randomUUID(),
@@ -424,12 +420,16 @@ Resources:
                 ],
               };
 
-              const item = { userId, program };
-              await dynamo.put({ TableName: PROGRAMS_TABLE, Item: item }).promise();
-              return json(200, item);
+              await dynamo.send(new PutCommand({
+                TableName: PROGRAMS_TABLE,
+                Item: { userId, program }
+              }));
+
+              return json(200, { userId, program });
             }
 
             return json(404, { error: "Not found" });
+
           } catch (e) {
             console.error(e);
             return json(500, { error: "Internal error" });
@@ -441,21 +441,8 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ProgramsTable
-      Events:
-        ProgramGet:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /program
-            Method: GET
-        ProgramGenerate:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /program/generate
-            Method: POST
 
-  ########################
+    ########################
   # MEMBERSHIP Lambda
   ########################
 
@@ -464,8 +451,12 @@ Resources:
     Properties:
       Handler: index.handler
       InlineCode: |
-        const AWS = require("aws-sdk");
-        const dynamo = new AWS.DynamoDB.DocumentClient();
+        const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+        const { DynamoDBDocumentClient, GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
+
+        const client = new DynamoDBClient({});
+        const dynamo = DynamoDBDocumentClient.from(client);
+
         const MEMBERSHIP_TABLE = process.env.MEMBERSHIP_TABLE;
 
         const json = (statusCode, body) => ({
@@ -478,20 +469,24 @@ Resources:
           try {
             const method = event.httpMethod;
 
-            // GET /membership?userId=...
             if (method === "GET") {
               const userId = event.requestContext.authorizer.claims.sub;
-              if (!userId) return json(400, { error: "Missing userId" });
+              if (!userId)
+                return json(400, { error: "Missing userId" });
 
-              const res = await dynamo.get({ TableName: MEMBERSHIP_TABLE, Key: { userId } }).promise();
+              const res = await dynamo.send(new GetCommand({
+                TableName: MEMBERSHIP_TABLE,
+                Key: { userId }
+              }));
+
               return json(200, res.Item || null);
             }
 
-            // POST /membership { userId, status, paidUntil }
             if (method === "POST") {
               const body = event.body ? JSON.parse(event.body) : {};
               const { userId, status, paidUntil } = body;
-              if (!userId || !status) return json(400, { error: "Missing userId/status" });
+              if (!userId || !status)
+                return json(400, { error: "Missing userId/status" });
 
               const item = {
                 userId,
@@ -500,11 +495,16 @@ Resources:
                 updatedAt: new Date().toISOString(),
               };
 
-              await dynamo.put({ TableName: MEMBERSHIP_TABLE, Item: item }).promise();
+              await dynamo.send(new PutCommand({
+                TableName: MEMBERSHIP_TABLE,
+                Item: item
+              }));
+
               return json(200, item);
             }
 
             return json(405, { error: "Method not allowed" });
+
           } catch (e) {
             console.error(e);
             return json(500, { error: "Internal error" });
@@ -516,19 +516,6 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MembershipTable
-      Events:
-        MembershipGet:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /membership
-            Method: GET
-        MembershipPost:
-          Type: Api
-          Properties:
-            RestApiId: !Ref GymApi
-            Path: /membership
-            Method: POST
 
 Outputs:
   ApiUrl:
