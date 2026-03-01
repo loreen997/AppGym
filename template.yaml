@@ -15,6 +15,37 @@ Globals:
 
 Resources:
 
+  #################################################
+  # COGNITO
+  #################################################
+
+  GymUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: GymUserPool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: false
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  GymUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: GymAppClient
+      UserPoolId: !Ref GymUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+        
   ########################
   # DynamoDB
   ########################
@@ -95,6 +126,11 @@ Resources:
         AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
         AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt GymUserPool.Arn
 
   ########################
   # USERS Lambda
@@ -120,7 +156,7 @@ Resources:
             const method = event.httpMethod;
 
             if (method === "GET") {
-              const userId = event.queryStringParameters?.userId;
+              const userId = event.requestContext.authorizer.claims.sub;
               if (!userId) return json(400, { error: "Missing userId" });
 
               const res = await dynamo.get({
@@ -359,7 +395,7 @@ Resources:
 
             // GET /program?userId=...
             if (method === "GET" && path.endsWith("/program")) {
-              const userId = event.queryStringParameters?.userId;
+              const userId = event.requestContext.authorizer.claims.sub;
               if (!userId) return json(400, { error: "Missing userId" });
 
               const res = await dynamo.get({ TableName: PROGRAMS_TABLE, Key: { userId } }).promise();
@@ -369,7 +405,7 @@ Resources:
             // POST /program/generate  { userId, inputs... }
             if (method === "POST" && path.endsWith("/program/generate")) {
               const body = event.body ? JSON.parse(event.body) : {};
-              const userId = body.userId;
+              const userId = event.requestContext.authorizer.claims.sub;
               if (!userId) return json(400, { error: "Missing userId" });
 
               const program = {
@@ -438,7 +474,7 @@ Resources:
 
             // GET /membership?userId=...
             if (method === "GET") {
-              const userId = event.queryStringParameters?.userId;
+              const userId = event.requestContext.authorizer.claims.sub;
               if (!userId) return json(400, { error: "Missing userId" });
 
               const res = await dynamo.get({ TableName: MEMBERSHIP_TABLE, Key: { userId } }).promise();
@@ -492,3 +528,9 @@ Outputs:
   ApiUrl:
     Description: Base URL
     Value: !Sub "https://${GymApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  UserPoolId:
+    Value: !Ref GymUserPool
+
+  UserPoolClientId:
+    Value: !Ref GymUserPoolClient
