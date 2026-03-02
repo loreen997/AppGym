@@ -143,6 +143,7 @@ Resources:
         import boto3
         import os
         from datetime import datetime
+        from decimal import Decimal
 
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(os.environ["USERS_TABLE"])
@@ -197,10 +198,10 @@ Resources:
 
                     if "weight" in body:
                         update_expr += ", weight = :weight"
-                        expr_values[":weight"] = body["weight"]
+                        expr_values[":weight"] = Decimal(str(body["weight"]))
                     if "height" in body:
                         update_expr += ", height = :height"
-                        expr_values[":height"] = body["height"]
+                        expr_values[":height"] = Decimal(str(body["height"]))
                     if "daysPerWeek" in body:
                         update_expr += ", daysPerWeek = :days"
                         expr_values[":days"] = body["daysPerWeek"]
