@@ -438,7 +438,7 @@ Resources:
           USERS_TABLE: !Ref UsersTable
           NOTIFIER_LAMBDA_ARN: !GetAtt NotifierFunction.Arn
           SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
-          SES_SENDER: "GYMAPP_CLASE@gmail.com"
+          SES_SENDER: "recordatorioclasegymapp@gmail.com"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ClassesTable
@@ -876,7 +876,7 @@ Resources:
         Variables:
           ENROLLMENTS_TABLE: !Ref EnrollmentsTable
           USERS_TABLE: !Ref UsersTable
-          SES_SENDER: "GYMAPP_CLASE@gmail.com"
+          SES_SENDER: "recordatorioclasegymapp@gmail.com"
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref EnrollmentsTable
