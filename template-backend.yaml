@@ -555,7 +555,7 @@ Resources:
         Variables:
           PROGRAMS_TABLE: !Ref ProgramsTable
           USERS_TABLE: !Ref UsersTable
-          OPENAI_API_KEY: !Ref OpenAIApiKey
+          OPENAI_API_KEY: ""
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ProgramsTable
