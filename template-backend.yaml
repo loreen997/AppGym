@@ -423,7 +423,7 @@ Resources:
         programs_table = dynamodb.Table(os.environ["PROGRAMS_TABLE"])
         users_table = dynamodb.Table(os.environ["USERS_TABLE"])
 
-        OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+        OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
         class DecimalEncoder(json.JSONEncoder):
             def default(self, obj):
@@ -439,6 +439,9 @@ Resources:
             }
 
         def call_openai(weight, height, days_per_week):
+            print(f"[OpenAI] Iniciando llamada. weight={weight}, height={height}, days_per_week={days_per_week}")
+            print(f"[OpenAI] API key presente: {bool(OPENAI_API_KEY)}, longitud: {len(OPENAI_API_KEY)}")
+
             prompt = (
                 f"Eres un entrenador personal experto. Crea un programa de entrenamiento semanal personalizado "
                 f"para un usuario con los siguientes datos:\n"
@@ -470,10 +473,22 @@ Resources:
                 method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=25) as res:
-                result = json.loads(res.read().decode("utf-8"))
+            try:
+                with urllib.request.urlopen(req, timeout=25) as res:
+                    raw = res.read().decode("utf-8")
+                    print(f"[OpenAI] Respuesta HTTP status: {res.status}")
+                    print(f"[OpenAI] Respuesta raw: {raw[:500]}")
+                    result = json.loads(raw)
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8")
+                print(f"[OpenAI] HTTPError {e.code}: {error_body}")
+                raise Exception(f"OpenAI HTTPError {e.code}: {error_body}")
+            except Exception as e:
+                print(f"[OpenAI] Error en urlopen: {str(e)}")
+                raise
 
             content = result["choices"][0]["message"]["content"].strip()
+            print(f"[OpenAI] Contenido recibido: {content[:300]}")
 
             # Limpiar posibles bloques de código markdown
             if content.startswith("```"):
@@ -482,57 +497,74 @@ Resources:
                     content = content[4:]
                 content = content.strip()
 
-            return json.loads(content)
+            parsed = json.loads(content)
+            print(f"[OpenAI] JSON parseado correctamente. Días: {len(parsed.get('days', []))}")
+            return parsed
 
         def handler(event, context):
             try:
+                print(f"[Handler] Evento recibido: method={event.get('httpMethod')}, path={event.get('path')}")
+
                 method = event["httpMethod"]
                 path = event.get("path", "")
                 user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
 
-                # GET /program — devuelve el programa si existe y tiene menos de 7 días
+                print(f"[Handler] user_id={user_id}")
+
+                # GET /program
                 if method == "GET" and path.endswith("/program"):
+                    print("[Handler] GET /program")
                     res = programs_table.get_item(Key={"userId": user_id})
                     item = res.get("Item")
 
                     if not item:
+                        print("[Handler] No hay programa para este usuario")
                         return response(200, None)
 
                     created_at_str = item.get("createdAt", "")
+                    print(f"[Handler] Programa encontrado, createdAt={created_at_str}")
+
                     if created_at_str:
                         created_at = datetime.fromisoformat(created_at_str).replace(tzinfo=timezone.utc)
                         now = datetime.now(timezone.utc)
                         age_days = (now - created_at).days
+                        print(f"[Handler] Antigüedad del programa: {age_days} días")
                         if age_days >= 7:
+                            print("[Handler] Programa expirado (>=7 días), devolviendo null")
                             return response(200, None)
 
+                    print("[Handler] Devolviendo programa vigente")
                     return response(200, item)
 
-                # POST /program/generate — genera programa con OpenAI y lo guarda
+                # POST /program/generate
                 if method == "POST" and path.endswith("/program/generate"):
+                    print("[Handler] POST /program/generate")
 
-                    # Leer datos del usuario desde DynamoDB
                     user_res = users_table.get_item(Key={"userId": user_id})
                     user = user_res.get("Item")
 
                     if not user:
+                        print("[Handler] Usuario no encontrado en DynamoDB")
                         return response(404, {"error": "User not found"})
+
+                    print(f"[Handler] Usuario encontrado: {json.dumps(user, cls=DecimalEncoder)}")
 
                     weight = float(user.get("weight", 70))
                     height = float(user.get("height", 170))
                     days_per_week = int(user.get("daysPerWeek", 3))
 
-                    # Llamar a OpenAI
+                    print(f"[Handler] Datos de entrenamiento: weight={weight}, height={height}, days={days_per_week}")
+
                     openai_result = call_openai(weight, height, days_per_week)
 
                     program = {
                         "id": str(uuid.uuid4()),
                         "createdAt": datetime.now(timezone.utc).isoformat(),
                         "inputs": {
-                            "weight": weight,
-                            "height": height,
-                            "daysPerWeek": days_per_week
-                        },
+                                "weight": Decimal(str(weight)),
+                                "height": Decimal(str(height)),
+                                "daysPerWeek": days_per_week
+                            },
                         "days": openai_result.get("days", [])
                     }
 
@@ -542,13 +574,19 @@ Resources:
                         "createdAt": program["createdAt"]
                     }
 
+                    print(f"[Handler] Guardando programa en DynamoDB, id={program['id']}")
                     programs_table.put_item(Item=item)
+                    print("[Handler] Programa guardado correctamente")
 
                     return response(200, item)
 
+                print(f"[Handler] Ruta no encontrada: {method} {path}")
                 return response(404, {"error": "Not found"})
 
             except Exception as e:
+                print(f"[Handler] ERROR GENERAL: {str(e)}")
+                import traceback
+                print(f"[Handler] Traceback: {traceback.format_exc()}")
                 return response(500, {"error": "Internal error", "details": str(e)})
 
       Environment:
