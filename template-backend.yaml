@@ -264,16 +264,24 @@ Resources:
         import boto3
         import os
         from datetime import datetime
+        from decimal import Decimal
 
         dynamodb = boto3.resource("dynamodb")
         classes_table = dynamodb.Table(os.environ["CLASSES_TABLE"])
         enrollments_table = dynamodb.Table(os.environ["ENROLLMENTS_TABLE"])
 
+        class DecimalEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, Decimal):
+                    return int(obj)
+                return super().default(obj)
+
+
         def response(code, body):
             return {
                 "statusCode": code,
                 "headers": {"Content-Type": "application/json"},
-                "body": json.dumps(body)
+                "body": json.dumps(body, cls=DecimalEncoder)
             }
 
         def handler(event, context):
@@ -307,12 +315,12 @@ Resources:
                     return response(200, item)
 
                 if method == "POST" and path.endswith("/classes/enroll"):
+                    user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
                     body = json.loads(event.get("body", "{}"))
                     class_id = body.get("classId")
-                    user_id = body.get("userId")
 
-                    if not class_id or not user_id:
-                        return response(400, {"error": "Missing classId/userId"})
+                    if not class_id:
+                        return response(400, {"error": "Missing classId"})
 
                     cls = classes_table.get_item(Key={"classId": class_id}).get("Item")
                     if not cls:
@@ -341,12 +349,12 @@ Resources:
                     return response(200, {"ok": True})
 
                 if method == "DELETE" and path.endswith("/classes/enroll"):
+                    user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
                     qs = event.get("queryStringParameters") or {}
                     class_id = qs.get("classId")
-                    user_id = qs.get("userId")
 
-                    if not class_id or not user_id:
-                        return response(400, {"error": "Missing classId/userId"})
+                    if not class_id:
+                        return response(400, {"error": "Missing classId"})
 
                     enrollments_table.delete_item(
                         Key={"classId": class_id, "userId": user_id}
@@ -634,7 +642,7 @@ Resources:
             return {
                 "statusCode": code,
                 "headers": {"Content-Type": "application/json"},
-                "body": json.dumps(body)
+                "body": json.dumps(body, cls=DecimalEncoder)
             }
 
         def handler(event, context):
