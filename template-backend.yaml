@@ -6,6 +6,10 @@ Parameters:
   StageName:
     Type: String
     Default: prod
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Description: OpenAI API Key
 
 Globals:
   Function:
@@ -130,9 +134,9 @@ Resources:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt GymUserPool.Arn
 
-########################
+  ########################
   # USERS Lambda
-  #########################
+  ########################
 
   UsersFunction:
     Type: AWS::Serverless::Function
@@ -250,7 +254,7 @@ Resources:
             Path: /users
             Method: PUT
 
-   ########################
+  ########################
   # CLASSES + ENROLL Lambda
   ########################
 
@@ -280,12 +284,10 @@ Resources:
                 method = event["httpMethod"]
                 path = event.get("path", "")
 
-                # GET /classes
                 if method == "GET" and path.endswith("/classes"):
                     res = classes_table.scan()
                     return response(200, res.get("Items", []))
 
-                # POST /classes
                 if method == "POST" and path.endswith("/classes"):
                     body = json.loads(event.get("body", "{}"))
                     class_id = body.get("classId")
@@ -307,7 +309,6 @@ Resources:
                     classes_table.put_item(Item=item)
                     return response(200, item)
 
-                # POST /classes/enroll
                 if method == "POST" and path.endswith("/classes/enroll"):
                     body = json.loads(event.get("body", "{}"))
                     class_id = body.get("classId")
@@ -326,7 +327,6 @@ Resources:
                     if enrolled >= capacity:
                         return response(400, {"error": "Class full"})
 
-                    # Write enrollment
                     enrollments_table.put_item(
                         Item={
                             "classId": class_id,
@@ -335,7 +335,6 @@ Resources:
                         }
                     )
 
-                    # Increment counter
                     classes_table.update_item(
                         Key={"classId": class_id},
                         UpdateExpression="SET enrolledCount = enrolledCount + :inc",
@@ -344,7 +343,6 @@ Resources:
 
                     return response(200, {"ok": True})
 
-                # DELETE /classes/enroll
                 if method == "DELETE" and path.endswith("/classes/enroll"):
                     qs = event.get("queryStringParameters") or {}
                     class_id = qs.get("classId")
@@ -380,8 +378,33 @@ Resources:
             TableName: !Ref ClassesTable
         - DynamoDBCrudPolicy:
             TableName: !Ref EnrollmentsTable
+      Events:
+        ClassesGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes
+            Method: GET
+        ClassesPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes
+            Method: POST
+        ClassesEnrollPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes/enroll
+            Method: POST
+        ClassesEnrollDelete:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /classes/enroll
+            Method: DELETE
 
-   ########################
+  ########################
   # PROGRAMS Lambda
   ########################
 
@@ -389,65 +412,140 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: index.handler
+      Timeout: 30
       InlineCode: |
         import json
         import boto3
         import os
         import uuid
-        from datetime import datetime
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        import urllib.request
 
         dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(os.environ["PROGRAMS_TABLE"])
+        programs_table = dynamodb.Table(os.environ["PROGRAMS_TABLE"])
+        users_table = dynamodb.Table(os.environ["USERS_TABLE"])
+
+        OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+        class DecimalEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, Decimal):
+                    return float(obj)
+                return super().default(obj)
 
         def response(code, body):
             return {
                 "statusCode": code,
                 "headers": {"Content-Type": "application/json"},
-                "body": json.dumps(body)
+                "body": json.dumps(body, cls=DecimalEncoder)
             }
+
+        def call_openai(weight, height, days_per_week):
+            prompt = (
+                f"Eres un entrenador personal experto. Crea un programa de entrenamiento semanal personalizado "
+                f"para un usuario con los siguientes datos:\n"
+                f"- Peso: {weight} kg\n"
+                f"- Altura: {height} cm\n"
+                f"- Días de entrenamiento por semana: {days_per_week}\n\n"
+                f"Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta, sin texto adicional:\n"
+                f'{{"days": [{{"day": "Lunes", "exercises": [{{"name": "Nombre ejercicio", "sets": 4, "reps": "8-10"}}]}}]}}\n'
+                f"Genera exactamente {days_per_week} días de entrenamiento con nombres de días en español. "
+                f"Cada día debe tener entre 4 y 6 ejercicios variados y apropiados para el perfil del usuario."
+            )
+
+            payload = json.dumps({
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 2000
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {OPENAI_API_KEY}"
+                },
+                method="POST"
+            )
+
+            with urllib.request.urlopen(req, timeout=25) as res:
+                result = json.loads(res.read().decode("utf-8"))
+
+            content = result["choices"][0]["message"]["content"].strip()
+
+            # Limpiar posibles bloques de código markdown
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+
+            return json.loads(content)
 
         def handler(event, context):
             try:
                 method = event["httpMethod"]
                 path = event.get("path", "")
+                user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
 
-                # GET /program
+                # GET /program — devuelve el programa si existe y tiene menos de 7 días
                 if method == "GET" and path.endswith("/program"):
-                    user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
-                    res = table.get_item(Key={"userId": user_id})
-                    return response(200, res.get("Item"))
+                    res = programs_table.get_item(Key={"userId": user_id})
+                    item = res.get("Item")
 
-                # POST /program/generate
+                    if not item:
+                        return response(200, None)
+
+                    created_at_str = item.get("createdAt", "")
+                    if created_at_str:
+                        created_at = datetime.fromisoformat(created_at_str).replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        age_days = (now - created_at).days
+                        if age_days >= 7:
+                            return response(200, None)
+
+                    return response(200, item)
+
+                # POST /program/generate — genera programa con OpenAI y lo guarda
                 if method == "POST" and path.endswith("/program/generate"):
-                    body = json.loads(event.get("body", "{}"))
-                    user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
+
+                    # Leer datos del usuario desde DynamoDB
+                    user_res = users_table.get_item(Key={"userId": user_id})
+                    user = user_res.get("Item")
+
+                    if not user:
+                        return response(404, {"error": "User not found"})
+
+                    weight = float(user.get("weight", 70))
+                    height = float(user.get("height", 170))
+                    days_per_week = int(user.get("daysPerWeek", 3))
+
+                    # Llamar a OpenAI
+                    openai_result = call_openai(weight, height, days_per_week)
 
                     program = {
                         "id": str(uuid.uuid4()),
-                        "createdAt": datetime.utcnow().isoformat(),
-                        "inputs": body.get("inputs", {}),
-                        "days": [
-                            {
-                                "day": "Lunes",
-                                "exercises": [
-                                    {"name": "Press banca", "sets": 4, "reps": "8-10"}
-                                ],
-                            },
-                            {
-                                "day": "Miércoles",
-                                "exercises": [
-                                    {"name": "Sentadilla", "sets": 4, "reps": "8-10"}
-                                ],
-                            },
-                        ],
+                        "createdAt": datetime.now(timezone.utc).isoformat(),
+                        "inputs": {
+                            "weight": weight,
+                            "height": height,
+                            "daysPerWeek": days_per_week
+                        },
+                        "days": openai_result.get("days", [])
                     }
 
                     item = {
                         "userId": user_id,
-                        "program": program
+                        "program": program,
+                        "createdAt": program["createdAt"]
                     }
 
-                    table.put_item(Item=item)
+                    programs_table.put_item(Item=item)
 
                     return response(200, item)
 
@@ -459,9 +557,26 @@ Resources:
       Environment:
         Variables:
           PROGRAMS_TABLE: !Ref ProgramsTable
+          USERS_TABLE: !Ref UsersTable
+          OPENAI_API_KEY: !Ref OpenAIApiKey
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ProgramsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        ProgramGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /program
+            Method: GET
+        ProgramGenerate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /program/generate
+            Method: POST
 
   ########################
   # MEMBERSHIP Lambda
@@ -491,13 +606,11 @@ Resources:
             try:
                 method = event["httpMethod"]
 
-                # GET /membership
                 if method == "GET":
                     user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
                     res = table.get_item(Key={"userId": user_id})
                     return response(200, res.get("Item"))
 
-                # POST /membership
                 if method == "POST":
                     body = json.loads(event.get("body", "{}"))
                     user_id = body.get("userId")
@@ -528,6 +641,19 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MembershipTable
+      Events:
+        MembershipGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /membership
+            Method: GET
+        MembershipPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /membership
+            Method: POST
 
 Outputs:
   ApiUrl:
