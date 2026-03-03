@@ -312,6 +312,34 @@ Resources:
                     }
 
                     classes_table.put_item(Item=item)
+
+                    # Crear schedule en EventBridge para notificar 1h antes
+                    try:
+                        from datetime import timezone, timedelta
+                        import re
+                        scheduler = boto3.client("scheduler")
+                        class_dt = datetime.fromisoformat(date_time)
+                        if class_dt.tzinfo is None:
+                            class_dt = class_dt.replace(tzinfo=timezone.utc)
+                        notify_dt = class_dt - timedelta(hours=1)
+                        notify_utc = notify_dt.astimezone(timezone.utc)
+                        schedule_expr = notify_utc.strftime("at(%Y-%m-%dT%H:%M:%S)")
+                        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '-', class_id)
+                        scheduler.create_schedule(
+                            Name=f"notify-class-{safe_id}",
+                            ScheduleExpression=schedule_expr,
+                            ScheduleExpressionTimezone="UTC",
+                            FlexibleTimeWindow={"Mode": "OFF"},
+                            Target={
+                                "Arn": os.environ["NOTIFIER_LAMBDA_ARN"],
+                                "RoleArn": os.environ["SCHEDULER_ROLE_ARN"],
+                                "Input": json.dumps({"classId": class_id, "className": name})
+                            },
+                            ActionAfterCompletion="DELETE"
+                        )
+                    except Exception as e:
+                        print(f"[Schedule] Error creando schedule: {str(e)}")
+
                     return response(200, item)
 
                 if method == "POST" and path.endswith("/classes/enroll"):
@@ -346,6 +374,35 @@ Resources:
                         ExpressionAttributeValues={":inc": 1}
                     )
 
+                    # Si queda menos de 1h para la clase, mandar email inmediatamente
+                    try:
+                        from datetime import timezone, timedelta
+                        class_dt = datetime.fromisoformat(cls.get("dateTime", ""))
+                        if class_dt.tzinfo is None:
+                            class_dt = class_dt.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        mins_left = (class_dt - now).total_seconds() / 60
+                        if 0 < mins_left < 60:
+                            users_table = boto3.resource("dynamodb").Table(os.environ["USERS_TABLE"])
+                            user = users_table.get_item(Key={"userId": user_id}).get("Item")
+                            if user and user.get("email"):
+                                ses = boto3.client("ses", region_name="us-east-1")
+                                ses.send_email(
+                                    Source=os.environ["SES_SENDER"],
+                                    Destination={"ToAddresses": [user["email"]]},
+                                    Message={
+                                        "Subject": {"Data": f"!Tu clase empieza en {int(mins_left)} minutos!"},
+                                        "Body": {"Text": {"Data": (
+                                            f"Hola {user.get('name', '')}!\n\n"
+                                            f"Te recordamos que la clase '{cls.get('name')}' "
+                                            f"empieza en menos de una hora.\n\n"
+                                            f"Nos vemos pronto!"
+                                        )}}
+                                    }
+                                )
+                    except Exception as e:
+                        print(f"[Enroll] Error enviando email inmediato: {str(e)}")
+
                     return response(200, {"ok": True})
 
                 if method == "DELETE" and path.endswith("/classes/enroll"):
@@ -378,11 +435,31 @@ Resources:
         Variables:
           CLASSES_TABLE: !Ref ClassesTable
           ENROLLMENTS_TABLE: !Ref EnrollmentsTable
+          USERS_TABLE: !Ref UsersTable
+          NOTIFIER_LAMBDA_ARN: !GetAtt NotifierFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
+          SES_SENDER: "GYMAPP_CLASE@gmail.com"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ClassesTable
         - DynamoDBCrudPolicy:
             TableName: !Ref EnrollmentsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - Statement:
+          - Effect: Allow
+            Action:
+              - scheduler:CreateSchedule
+              - scheduler:DeleteSchedule
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !GetAtt SchedulerRole.Arn
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+            Resource: "*"
       Events:
         ClassesGet:
           Type: Api
@@ -697,6 +774,119 @@ Resources:
             RestApiId: !Ref GymApi
             Path: /membership
             Method: POST
+
+
+  ########################
+  # IAM ROLE para EventBridge Scheduler
+  ########################
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GymSchedulerRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeNotifierLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt NotifierFunction.Arn
+
+  ########################
+  # NOTIFIER Lambda
+  ########################
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Timeout: 30
+      InlineCode: |
+        import json
+        import boto3
+        import os
+
+        dynamodb = boto3.resource("dynamodb")
+        enrollments_table = dynamodb.Table(os.environ["ENROLLMENTS_TABLE"])
+        users_table = dynamodb.Table(os.environ["USERS_TABLE"])
+        ses = boto3.client("ses", region_name="us-east-1")
+
+        def handler(event, context):
+            try:
+                class_id = event.get("classId")
+                class_name = event.get("className", "tu clase")
+
+                print(f"[Notifier] Notificando clase {class_id} - {class_name}")
+
+                # Obtener todos los inscritos en la clase
+                result = enrollments_table.query(
+                    KeyConditionExpression=boto3.dynamodb.conditions.Key("classId").eq(class_id)
+                )
+                enrollments = result.get("Items", [])
+                print(f"[Notifier] Inscritos: {len(enrollments)}")
+
+                for enrollment in enrollments:
+                    user_id = enrollment.get("userId")
+                    user = users_table.get_item(Key={"userId": user_id}).get("Item")
+
+                    if not user or not user.get("email"):
+                        print(f"[Notifier] Usuario {user_id} sin email, saltando")
+                        continue
+
+                    email = user["email"]
+                    name = user.get("name", "")
+
+                    try:
+                        ses.send_email(
+                            Source=os.environ["SES_SENDER"],
+                            Destination={"ToAddresses": [email]},
+                            Message={
+                                "Subject": {"Data": f"Recordatorio: {class_name} empieza en 1 hora"},
+                                "Body": {"Text": {"Data": (
+                                    f"Hola {name}!
+
+        "
+                                    f"Te recordamos que la clase '{class_name}' "
+                                    f"empieza en 1 hora.
+
+        "
+                                    f"Nos vemos pronto!"
+                                )}}
+                            }
+                        )
+                        print(f"[Notifier] Email enviado a {email}")
+                    except Exception as e:
+                        print(f"[Notifier] Error enviando a {email}: {str(e)}")
+
+                return {"ok": True, "notified": len(enrollments)}
+
+            except Exception as e:
+                print(f"[Notifier] ERROR: {str(e)}")
+                return {"ok": False, "error": str(e)}
+
+      Environment:
+        Variables:
+          ENROLLMENTS_TABLE: !Ref EnrollmentsTable
+          USERS_TABLE: !Ref UsersTable
+          SES_SENDER: "GYMAPP_CLASE@gmail.com"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EnrollmentsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - Statement:
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+            Resource: "*"
 
 Outputs:
   ApiUrl:
