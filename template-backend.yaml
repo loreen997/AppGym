@@ -347,12 +347,17 @@ Resources:
                     body = json.loads(event.get("body", "{}"))
                     class_id = body.get("classId")
 
+                    print(f"[Enroll] Inicio enroll - userId={user_id}, classId={class_id}")
+
                     if not class_id:
                         return response(400, {"error": "Missing classId"})
 
                     cls = classes_table.get_item(Key={"classId": class_id}).get("Item")
                     if not cls:
+                        print(f"[Enroll] ERROR: Clase no encontrada en DynamoDB para classId={class_id}")
                         return response(404, {"error": "Class not found"})
+
+                    print(f"[Enroll] Clase encontrada: name={cls.get('name')}, dateTime={cls.get('dateTime')}, capacity={cls.get('capacity')}, enrolledCount={cls.get('enrolledCount')}")
 
                     capacity = cls.get("capacity", 20)
                     enrolled = cls.get("enrolledCount", 0)
@@ -367,42 +372,79 @@ Resources:
                             "createdAt": datetime.utcnow().isoformat()
                         }
                     )
+                    print(f"[Enroll] Inscripción guardada en EnrollmentsTable")
 
                     classes_table.update_item(
                         Key={"classId": class_id},
                         UpdateExpression="SET enrolledCount = enrolledCount + :inc",
                         ExpressionAttributeValues={":inc": 1}
                     )
+                    print(f"[Enroll] enrolledCount incrementado")
 
                     # Si queda menos de 1h para la clase, mandar email inmediatamente
                     try:
                         from datetime import timezone, timedelta
-                        class_dt = datetime.fromisoformat(cls.get("dateTime", ""))
-                        if class_dt.tzinfo is None:
-                            class_dt = class_dt.replace(tzinfo=timezone.utc)
-                        now = datetime.now(timezone.utc)
-                        mins_left = (class_dt - now).total_seconds() / 60
-                        if 0 < mins_left < 60:
-                            users_table = boto3.resource("dynamodb").Table(os.environ["USERS_TABLE"])
-                            user = users_table.get_item(Key={"userId": user_id}).get("Item")
-                            if user and user.get("email"):
-                                ses = boto3.client("ses", region_name="us-east-1")
-                                ses.send_email(
-                                    Source=os.environ["SES_SENDER"],
-                                    Destination={"ToAddresses": [user["email"]]},
-                                    Message={
-                                        "Subject": {"Data": f"!Tu clase empieza en {int(mins_left)} minutos!"},
-                                        "Body": {"Text": {"Data": (
-                                            f"Hola {user.get('name', '')}!\n\n"
-                                            f"Te recordamos que la clase '{cls.get('name')}' "
-                                            f"empieza en menos de una hora.\n\n"
-                                            f"Nos vemos pronto!"
-                                        )}}
-                                    }
-                                )
-                    except Exception as e:
-                        print(f"[Enroll] Error enviando email inmediato: {str(e)}")
 
+                        raw_date = cls.get("dateTime", "")
+                        print(f"[Enroll][Email] dateTime raw de DynamoDB: '{raw_date}'")
+
+                        if not raw_date:
+                            print(f"[Enroll][Email] ERROR: dateTime está vacío, no se puede calcular tiempo restante")
+                        else:
+                            class_dt = datetime.fromisoformat(raw_date)
+                            print(f"[Enroll][Email] dateTime parseado: {class_dt}")
+
+                            if class_dt.tzinfo is None:
+                                class_dt = class_dt.replace(tzinfo=timezone.utc)
+                                print(f"[Enroll][Email] Sin timezone, asignado UTC: {class_dt}")
+
+                            now = datetime.now(timezone.utc)
+                            mins_left = (class_dt - now).total_seconds() / 60
+                            print(f"[Enroll][Email] Ahora (UTC): {now}")
+                            print(f"[Enroll][Email] Minutos restantes para la clase: {mins_left:.2f}")
+
+                            if mins_left <= 0:
+                                print(f"[Enroll][Email] La clase ya ha pasado (mins_left={mins_left:.2f}), no se manda email")
+                            elif mins_left >= 60:
+                                print(f"[Enroll][Email] Queda más de 1h (mins_left={mins_left:.2f}), el schedule se encargará, no se manda email ahora")
+                            else:
+                                print(f"[Enroll][Email] Queda menos de 1h → intentando mandar email inmediato")
+
+                                users_table = boto3.resource("dynamodb").Table(os.environ["USERS_TABLE"])
+                                user = users_table.get_item(Key={"userId": user_id}).get("Item")
+                                print(f"[Enroll][Email] Usuario obtenido de DynamoDB: {user}")
+
+                                if not user:
+                                    print(f"[Enroll][Email] ERROR: Usuario {user_id} no encontrado en UsersTable")
+                                elif not user.get("email"):
+                                    print(f"[Enroll][Email] ERROR: Usuario {user_id} no tiene campo 'email' en DynamoDB")
+                                else:
+                                    dest_email = user["email"]
+                                    sender_email = os.environ["SES_SENDER"]
+                                    print(f"[Enroll][Email] Enviando email: de={sender_email} a={dest_email}")
+
+                                    ses = boto3.client("ses", region_name="us-east-1")
+                                    ses_response = ses.send_email(
+                                        Source=sender_email,
+                                        Destination={"ToAddresses": [dest_email]},
+                                        Message={
+                                            "Subject": {"Data": f"!Tu clase empieza en {int(mins_left)} minutos!"},
+                                            "Body": {"Text": {"Data": (
+                                                f"Hola {user.get('name', '')}!\n\n"
+                                                f"Te recordamos que la clase '{cls.get('name')}' "
+                                                f"empieza en menos de una hora.\n\n"
+                                                f"Nos vemos pronto!"
+                                            )}}
+                                        }
+                                    )
+                                    print(f"[Enroll][Email] Email enviado correctamente. MessageId={ses_response.get('MessageId')}")
+
+                    except Exception as e:
+                        print(f"[Enroll][Email] EXCEPCION al procesar email: {str(e)}")
+                        import traceback
+                        print(f"[Enroll][Email] Traceback: {traceback.format_exc()}")
+
+                    print(f"[Enroll] Proceso completado para userId={user_id}, classId={class_id}")
                     return response(200, {"ok": True})
 
                 if method == "DELETE" and path.endswith("/classes/enroll"):
