@@ -212,6 +212,12 @@ Resources:
                     if "daysPerWeek" in body:
                         update_expr += ", daysPerWeek = :days"
                         expr_values[":days"] = body["daysPerWeek"]
+                    if "trainingType" in body and body["trainingType"]:
+                        update_expr += ", trainingType = :trainingType"
+                        expr_values[":trainingType"] = body["trainingType"]
+                    if "gender" in body and body["gender"]:
+                        update_expr += ", gender = :gender"
+                        expr_values[":gender"] = body["gender"]
 
                     table.update_item(
                         Key={"userId": user_id},
@@ -565,16 +571,31 @@ Resources:
                 "body": json.dumps(body, cls=DecimalEncoder)
             }
 
-        def call_openai(weight, height, days_per_week):
-            print(f"[OpenAI] Iniciando llamada. weight={weight}, height={height}, days_per_week={days_per_week}")
+        def call_openai(weight, height, days_per_week, training_type=None, gender=None):
+            print(f"[OpenAI] Iniciando llamada. weight={weight}, height={height}, days_per_week={days_per_week}, training_type={training_type}, gender={gender}")
             print(f"[OpenAI] API key presente: {bool(OPENAI_API_KEY)}, longitud: {len(OPENAI_API_KEY)}")
+
+            training_labels = {
+                "strength":    "fuerza (ejercicios compuestos pesados, bajas repeticiones)",
+                "hypertrophy": "musculación (volumen moderado-alto, series de 8-12 reps)",
+                "weight_loss": "pérdida de peso (circuitos, cardio funcional, alta intensidad)"
+            }
+            gender_labels = {
+                "male":   "hombre",
+                "female": "mujer",
+                "other":  "persona"
+            }
+            training_desc = training_labels.get(training_type, "entrenamiento general equilibrado")
+            gender_desc   = gender_labels.get(gender, "persona")
 
             prompt = (
                 f"Eres un entrenador personal experto. Crea un programa de entrenamiento semanal personalizado "
-                f"para un usuario con los siguientes datos:\n"
+                f"para un/a {gender_desc} con los siguientes datos:\n"
                 f"- Peso: {weight} kg\n"
                 f"- Altura: {height} cm\n"
-                f"- Días de entrenamiento por semana: {days_per_week}\n\n"
+                f"- Días de entrenamiento por semana: {days_per_week}\n"
+                f"- Objetivo: {training_desc}\n\n"
+                f"Adapta los ejercicios, series y repeticiones al objetivo indicado. "
                 f"Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta, sin texto adicional:\n"
                 f'{{"days": [{{"day": "Lunes", "exercises": [{{"name": "Nombre ejercicio", "sets": 4, "reps": "8-10"}}]}}]}}\n'
                 f"Genera exactamente {days_per_week} días de entrenamiento con nombres de días en español. "
@@ -676,21 +697,25 @@ Resources:
 
                     print(f"[Handler] Usuario encontrado: {json.dumps(user, cls=DecimalEncoder)}")
 
-                    weight = float(user.get("weight", 70))
-                    height = float(user.get("height", 170))
+                    weight        = float(user.get("weight", 70))
+                    height        = float(user.get("height", 170))
                     days_per_week = int(user.get("daysPerWeek", 3))
+                    training_type = user.get("trainingType")
+                    gender        = user.get("gender")
 
-                    print(f"[Handler] Datos de entrenamiento: weight={weight}, height={height}, days={days_per_week}")
+                    print(f"[Handler] Datos de entrenamiento: weight={weight}, height={height}, days={days_per_week}, training_type={training_type}, gender={gender}")
 
-                    openai_result = call_openai(weight, height, days_per_week)
+                    openai_result = call_openai(weight, height, days_per_week, training_type, gender)
 
                     program = {
                         "id": str(uuid.uuid4()),
                         "createdAt": datetime.now(timezone.utc).isoformat(),
                         "inputs": {
-                                "weight": Decimal(str(weight)),
-                                "height": Decimal(str(height)),
-                                "daysPerWeek": days_per_week
+                                "weight":       Decimal(str(weight)),
+                                "height":       Decimal(str(height)),
+                                "daysPerWeek":  days_per_week,
+                                "trainingType": training_type or "general",
+                                "gender":       gender or "other"
                             },
                         "days": openai_result.get("days", [])
                     }
