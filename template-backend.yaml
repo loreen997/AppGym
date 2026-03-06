@@ -634,17 +634,43 @@ Resources:
                 method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=55) as res:
-                raw    = res.read().decode("utf-8")
-                result = json.loads(raw)
+            print(f"[OpenAI] key_len={len(OPENAI_API_KEY)} key_start={OPENAI_API_KEY[:8] if OPENAI_API_KEY else 'VACIA'}")
+            print(f"[OpenAI] payload_bytes={len(payload)}")
+
+            try:
+                with urllib.request.urlopen(req, timeout=55) as res:
+                    http_status = res.status
+                    raw = res.read().decode("utf-8")
+                    print(f"[OpenAI] http_status={http_status} response_len={len(raw)}")
+                    result = json.loads(raw)
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8") if e.fp else "no_body"
+                print(f"[OpenAI] HTTPError code={e.code} reason={e.reason} body={err_body[:500]}")
+                raise
+
+            finish_reason = result.get("choices", [{}])[0].get("finish_reason", "unknown")
+            print(f"[OpenAI] finish_reason={finish_reason}")
 
             content = result["choices"][0]["message"]["content"].strip()
+            print(f"[OpenAI] content_preview={content[:300]}")
+
             if content.startswith("```"):
                 content = content.split("```")[1]
                 if content.startswith("json"):
                     content = content[4:]
                 content = content.strip()
-            return json.loads(content)
+
+            try:
+                parsed = json.loads(content)
+                days = parsed.get("days", [])
+                print(f"[OpenAI] dias_generados={len(days)}")
+                for i, d in enumerate(days):
+                    print(f"[OpenAI]   dia[{i}]={d.get('day')} ejercicios={len(d.get('exercises', []))}")
+                return parsed
+            except json.JSONDecodeError as e:
+                print(f"[OpenAI] JSON_PARSE_ERROR={e}")
+                print(f"[OpenAI] raw_content={content[:1000]}")
+                raise
 
         # ── Handler ───────────────────────────────────────────────────────────
 
@@ -678,6 +704,7 @@ Resources:
                     user_res = users_table.get_item(Key={"userId": user_id})
                     user = user_res.get("Item")
                     if not user:
+                        print(f"[Generate] user_id={user_id} NOT FOUND en DynamoDB")
                         return resp(404, {"error": "User not found"})
 
                     weight        = float(user.get("weight", 70))
@@ -686,7 +713,9 @@ Resources:
                     training_type = user.get("trainingType")
                     gender        = user.get("gender")
 
+                    print(f"[Generate] user_id={user_id} weight={weight} height={height} days={days_per_week} type={training_type} gender={gender}")
                     openai_result = call_openai(weight, height, days_per_week, training_type, gender)
+                    print(f"[Generate] OpenAI OK, days={len(openai_result.get('days', []))}")
 
                     program_id = str(uuid.uuid4())
                     now_iso    = datetime.now(timezone.utc).isoformat()
