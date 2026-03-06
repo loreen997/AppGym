@@ -89,6 +89,9 @@ Resources:
         - AttributeName: userId
           KeyType: RANGE
 
+  # ── NUEVA: tabla de programas con clave compuesta userId + programId ──────────
+  # Reemplaza a ProgramsTable (solo userId). Ahora se guardan TODOS los programas
+  # del usuario. El "activo" es el que tiene isActive=true (o el más reciente).
   ProgramsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -97,9 +100,13 @@ Resources:
       AttributeDefinitions:
         - AttributeName: userId
           AttributeType: S
+        - AttributeName: programId
+          AttributeType: S
       KeySchema:
         - AttributeName: userId
           KeyType: HASH
+        - AttributeName: programId
+          KeyType: RANGE
 
   MembershipTable:
     Type: AWS::DynamoDB::Table
@@ -319,7 +326,6 @@ Resources:
 
                     classes_table.put_item(Item=item)
 
-                    # Crear schedule en EventBridge para notificar 1h antes
                     try:
                         from datetime import timezone, timedelta
                         import re
@@ -353,17 +359,12 @@ Resources:
                     body = json.loads(event.get("body", "{}"))
                     class_id = body.get("classId")
 
-                    print(f"[Enroll] Inicio enroll - userId={user_id}, classId={class_id}")
-
                     if not class_id:
                         return response(400, {"error": "Missing classId"})
 
                     cls = classes_table.get_item(Key={"classId": class_id}).get("Item")
                     if not cls:
-                        print(f"[Enroll] ERROR: Clase no encontrada en DynamoDB para classId={class_id}")
                         return response(404, {"error": "Class not found"})
-
-                    print(f"[Enroll] Clase encontrada: name={cls.get('name')}, dateTime={cls.get('dateTime')}, capacity={cls.get('capacity')}, enrolledCount={cls.get('enrolledCount')}")
 
                     capacity = cls.get("capacity", 20)
                     enrolled = cls.get("enrolledCount", 0)
@@ -378,79 +379,42 @@ Resources:
                             "createdAt": datetime.utcnow().isoformat()
                         }
                     )
-                    print(f"[Enroll] Inscripción guardada en EnrollmentsTable")
 
                     classes_table.update_item(
                         Key={"classId": class_id},
                         UpdateExpression="SET enrolledCount = enrolledCount + :inc",
                         ExpressionAttributeValues={":inc": 1}
                     )
-                    print(f"[Enroll] enrolledCount incrementado")
 
-                    # Si queda menos de 1h para la clase, mandar email inmediatamente
                     try:
                         from datetime import timezone, timedelta
-
                         raw_date = cls.get("dateTime", "")
-                        print(f"[Enroll][Email] dateTime raw de DynamoDB: '{raw_date}'")
-
-                        if not raw_date:
-                            print(f"[Enroll][Email] ERROR: dateTime está vacío, no se puede calcular tiempo restante")
-                        else:
+                        if raw_date:
                             class_dt = datetime.fromisoformat(raw_date)
-                            print(f"[Enroll][Email] dateTime parseado: {class_dt}")
-
                             if class_dt.tzinfo is None:
                                 class_dt = class_dt.replace(tzinfo=timezone.utc)
-                                print(f"[Enroll][Email] Sin timezone, asignado UTC: {class_dt}")
-
                             now = datetime.now(timezone.utc)
                             mins_left = (class_dt - now).total_seconds() / 60
-                            print(f"[Enroll][Email] Ahora (UTC): {now}")
-                            print(f"[Enroll][Email] Minutos restantes para la clase: {mins_left:.2f}")
-
-                            if mins_left <= 0:
-                                print(f"[Enroll][Email] La clase ya ha pasado (mins_left={mins_left:.2f}), no se manda email")
-                            elif mins_left >= 60:
-                                print(f"[Enroll][Email] Queda más de 1h (mins_left={mins_left:.2f}), el schedule se encargará, no se manda email ahora")
-                            else:
-                                print(f"[Enroll][Email] Queda menos de 1h → intentando mandar email inmediato")
-
+                            if 0 < mins_left < 60:
                                 users_table = boto3.resource("dynamodb").Table(os.environ["USERS_TABLE"])
                                 user = users_table.get_item(Key={"userId": user_id}).get("Item")
-                                print(f"[Enroll][Email] Usuario obtenido de DynamoDB: {user}")
-
-                                if not user:
-                                    print(f"[Enroll][Email] ERROR: Usuario {user_id} no encontrado en UsersTable")
-                                elif not user.get("email"):
-                                    print(f"[Enroll][Email] ERROR: Usuario {user_id} no tiene campo 'email' en DynamoDB")
-                                else:
-                                    dest_email = user["email"]
-                                    sender_email = os.environ["SES_SENDER"]
-                                    print(f"[Enroll][Email] Enviando email: de={sender_email} a={dest_email}")
-
+                                if user and user.get("email"):
                                     ses = boto3.client("ses", region_name="us-east-1")
-                                    ses_response = ses.send_email(
-                                        Source=sender_email,
-                                        Destination={"ToAddresses": [dest_email]},
+                                    ses.send_email(
+                                        Source=os.environ["SES_SENDER"],
+                                        Destination={"ToAddresses": [user["email"]]},
                                         Message={
                                             "Subject": {"Data": f"!Tu clase empieza en {int(mins_left)} minutos!"},
                                             "Body": {"Text": {"Data": (
                                                 f"Hola {user.get('name', '')}!\n\n"
                                                 f"Te recordamos que la clase '{cls.get('name')}' "
-                                                f"empieza en menos de una hora.\n\n"
-                                                f"Nos vemos pronto!"
+                                                f"empieza en menos de una hora.\n\nNos vemos pronto!"
                                             )}}
                                         }
                                     )
-                                    print(f"[Enroll][Email] Email enviado correctamente. MessageId={ses_response.get('MessageId')}")
-
                     except Exception as e:
-                        print(f"[Enroll][Email] EXCEPCION al procesar email: {str(e)}")
-                        import traceback
-                        print(f"[Enroll][Email] Traceback: {traceback.format_exc()}")
+                        print(f"[Enroll][Email] EXCEPCION: {str(e)}")
 
-                    print(f"[Enroll] Proceso completado para userId={user_id}, classId={class_id}")
                     return response(200, {"ok": True})
 
                 if method == "DELETE" and path.endswith("/classes/enroll"):
@@ -535,7 +499,13 @@ Resources:
             Method: DELETE
 
   ########################
-  # PROGRAMS Lambda
+  # PROGRAMS Lambda  (reescrito)
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Endpoints:
+  #   GET  /program          → devuelve el programa ACTIVO (isActive=true, <7 días)
+  #   POST /program/generate → genera nuevo programa con OpenAI y lo marca activo
+  #   GET  /program/history  → devuelve todos los programas del usuario (histórico)
+  #   PUT  /program/complete → marca ejercicios/días como completados y recalcula score
   ########################
 
   ProgramsFunction:
@@ -551,10 +521,11 @@ Resources:
         from datetime import datetime, timezone
         from decimal import Decimal
         import urllib.request
+        from boto3.dynamodb.conditions import Key
 
         dynamodb = boto3.resource("dynamodb")
         programs_table = dynamodb.Table(os.environ["PROGRAMS_TABLE"])
-        users_table = dynamodb.Table(os.environ["USERS_TABLE"])
+        users_table    = dynamodb.Table(os.environ["USERS_TABLE"])
 
         OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
@@ -564,35 +535,69 @@ Resources:
                     return float(obj)
                 return super().default(obj)
 
-        def response(code, body):
+        def resp(code, body):
             return {
                 "statusCode": code,
                 "headers": {"Content-Type": "application/json"},
                 "body": json.dumps(body, cls=DecimalEncoder)
             }
 
-        def call_openai(weight, height, days_per_week, training_type=None, gender=None):
-            print(f"[OpenAI] Iniciando llamada. weight={weight}, height={height}, days_per_week={days_per_week}, training_type={training_type}, gender={gender}")
-            print(f"[OpenAI] API key presente: {bool(OPENAI_API_KEY)}, longitud: {len(OPENAI_API_KEY)}")
+        # ── Helpers ──────────────────────────────────────────────────────────
 
+        def calc_score(program_item):
+            """
+            Calcula el porcentaje de ejercicios completados en el programa.
+            completedExercises es un dict { "dayIndex_exIndex": true }
+            """
+            days = program_item.get("program", {}).get("days", [])
+            total = sum(len(d.get("exercises", [])) for d in days)
+            if total == 0:
+                return Decimal("0")
+            completed_map = program_item.get("completedExercises", {})
+            done = sum(1 for v in completed_map.values() if v)
+            return Decimal(str(round(done * 100 / total, 1)))
+
+        def get_active_program(user_id):
+            """Devuelve el programa activo del usuario o None."""
+            result = programs_table.query(
+                KeyConditionExpression=Key("userId").eq(user_id),
+                FilterExpression=boto3.dynamodb.conditions.Attr("isActive").eq(True)
+            )
+            items = result.get("Items", [])
+            if not items:
+                return None
+            # ordenar por createdAt desc y coger el más reciente
+            items.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
+            return items[0]
+
+        def deactivate_all(user_id):
+            """Marca todos los programas del usuario como isActive=false."""
+            result = programs_table.query(
+                KeyConditionExpression=Key("userId").eq(user_id)
+            )
+            for item in result.get("Items", []):
+                programs_table.update_item(
+                    Key={"userId": user_id, "programId": item["programId"]},
+                    UpdateExpression="SET isActive = :f",
+                    ExpressionAttributeValues={":f": False}
+                )
+
+        # ── OpenAI ───────────────────────────────────────────────────────────
+
+        def call_openai(weight, height, days_per_week, training_type=None, gender=None):
             training_labels = {
                 "strength":    "fuerza (ejercicios compuestos pesados, bajas repeticiones)",
                 "hypertrophy": "musculación (volumen moderado-alto, series de 8-12 reps)",
                 "weight_loss": "pérdida de peso (circuitos, cardio funcional, alta intensidad)"
             }
-            gender_labels = {
-                "male":   "hombre",
-                "female": "mujer",
-                "other":  "persona"
-            }
+            gender_labels = {"male": "hombre", "female": "mujer", "other": "persona"}
             training_desc = training_labels.get(training_type, "entrenamiento general equilibrado")
             gender_desc   = gender_labels.get(gender, "persona")
 
             prompt = (
                 f"Eres un entrenador personal experto. Crea un programa de entrenamiento semanal personalizado "
                 f"para un/a {gender_desc} con los siguientes datos:\n"
-                f"- Peso: {weight} kg\n"
-                f"- Altura: {height} cm\n"
+                f"- Peso: {weight} kg\n- Altura: {height} cm\n"
                 f"- Días de entrenamiento por semana: {days_per_week}\n"
                 f"- Objetivo: {training_desc}\n\n"
                 f"Adapta los ejercicios, series y repeticiones al objetivo indicado. "
@@ -604,9 +609,7 @@ Resources:
 
             payload = json.dumps({
                 "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.7,
                 "max_tokens": 2000
             }).encode("utf-8")
@@ -621,81 +624,53 @@ Resources:
                 method="POST"
             )
 
-            try:
-                with urllib.request.urlopen(req, timeout=25) as res:
-                    raw = res.read().decode("utf-8")
-                    print(f"[OpenAI] Respuesta HTTP status: {res.status}")
-                    print(f"[OpenAI] Respuesta raw: {raw[:500]}")
-                    result = json.loads(raw)
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode("utf-8")
-                print(f"[OpenAI] HTTPError {e.code}: {error_body}")
-                raise Exception(f"OpenAI HTTPError {e.code}: {error_body}")
-            except Exception as e:
-                print(f"[OpenAI] Error en urlopen: {str(e)}")
-                raise
+            with urllib.request.urlopen(req, timeout=25) as res:
+                raw = res.read().decode("utf-8")
+                result = json.loads(raw)
 
             content = result["choices"][0]["message"]["content"].strip()
-            print(f"[OpenAI] Contenido recibido: {content[:300]}")
-
-            # Limpiar posibles bloques de código markdown
             if content.startswith("```"):
                 content = content.split("```")[1]
                 if content.startswith("json"):
                     content = content[4:]
                 content = content.strip()
+            return json.loads(content)
 
-            parsed = json.loads(content)
-            print(f"[OpenAI] JSON parseado correctamente. Días: {len(parsed.get('days', []))}")
-            return parsed
+        # ── Handler ───────────────────────────────────────────────────────────
 
         def handler(event, context):
             try:
-                print(f"[Handler] Evento recibido: method={event.get('httpMethod')}, path={event.get('path')}")
-
-                method = event["httpMethod"]
-                path = event.get("path", "")
+                method  = event["httpMethod"]
+                path    = event.get("path", "")
                 user_id = event["requestContext"]["authorizer"]["claims"]["sub"]
 
-                print(f"[Handler] user_id={user_id}")
-
-                # GET /program
+                # ── GET /program ────────────────────────────────────────────
                 if method == "GET" and path.endswith("/program"):
-                    print("[Handler] GET /program")
-                    res = programs_table.get_item(Key={"userId": user_id})
-                    item = res.get("Item")
-
+                    item = get_active_program(user_id)
                     if not item:
-                        print("[Handler] No hay programa para este usuario")
-                        return response(200, None)
+                        return resp(200, None)
 
+                    # Caducar si tiene más de 7 días
                     created_at_str = item.get("createdAt", "")
-                    print(f"[Handler] Programa encontrado, createdAt={created_at_str}")
-
                     if created_at_str:
                         created_at = datetime.fromisoformat(created_at_str).replace(tzinfo=timezone.utc)
-                        now = datetime.now(timezone.utc)
-                        age_days = (now - created_at).days
-                        print(f"[Handler] Antigüedad del programa: {age_days} días")
-                        if age_days >= 7:
-                            print("[Handler] Programa expirado (>=7 días), devolviendo null")
-                            return response(200, None)
+                        if (datetime.now(timezone.utc) - created_at).days >= 7:
+                            # Marcamos como inactivo pero lo conservamos en histórico
+                            programs_table.update_item(
+                                Key={"userId": user_id, "programId": item["programId"]},
+                                UpdateExpression="SET isActive = :f",
+                                ExpressionAttributeValues={":f": False}
+                            )
+                            return resp(200, None)
 
-                    print("[Handler] Devolviendo programa vigente")
-                    return response(200, item)
+                    return resp(200, item)
 
-                # POST /program/generate
+                # ── POST /program/generate ──────────────────────────────────
                 if method == "POST" and path.endswith("/program/generate"):
-                    print("[Handler] POST /program/generate")
-
                     user_res = users_table.get_item(Key={"userId": user_id})
                     user = user_res.get("Item")
-
                     if not user:
-                        print("[Handler] Usuario no encontrado en DynamoDB")
-                        return response(404, {"error": "User not found"})
-
-                    print(f"[Handler] Usuario encontrado: {json.dumps(user, cls=DecimalEncoder)}")
+                        return resp(404, {"error": "User not found"})
 
                     weight        = float(user.get("weight", 70))
                     height        = float(user.get("height", 170))
@@ -703,43 +678,135 @@ Resources:
                     training_type = user.get("trainingType")
                     gender        = user.get("gender")
 
-                    print(f"[Handler] Datos de entrenamiento: weight={weight}, height={height}, days={days_per_week}, training_type={training_type}, gender={gender}")
-
                     openai_result = call_openai(weight, height, days_per_week, training_type, gender)
 
+                    program_id = str(uuid.uuid4())
+                    now_iso    = datetime.now(timezone.utc).isoformat()
+
                     program = {
-                        "id": str(uuid.uuid4()),
-                        "createdAt": datetime.now(timezone.utc).isoformat(),
+                        "id": program_id,
+                        "createdAt": now_iso,
                         "inputs": {
-                                "weight":       Decimal(str(weight)),
-                                "height":       Decimal(str(height)),
-                                "daysPerWeek":  days_per_week,
-                                "trainingType": training_type or "general",
-                                "gender":       gender or "other"
-                            },
+                            "weight":       Decimal(str(weight)),
+                            "height":       Decimal(str(height)),
+                            "daysPerWeek":  days_per_week,
+                            "trainingType": training_type or "general",
+                            "gender":       gender or "other"
+                        },
                         "days": openai_result.get("days", [])
                     }
 
                     item = {
-                        "userId": user_id,
-                        "program": program,
-                        "createdAt": program["createdAt"]
+                        "userId":             user_id,
+                        "programId":          program_id,
+                        "program":            program,
+                        "createdAt":          now_iso,
+                        "isActive":           True,
+                        # completedExercises: {"dayIndex_exIndex": true/false}
+                        "completedExercises": {},
+                        # completedDays: {"dayIndex": true/false}
+                        "completedDays":      {},
+                        "score":              Decimal("0")
                     }
 
-                    print(f"[Handler] Guardando programa en DynamoDB, id={program['id']}")
+                    # Desactivar programas anteriores antes de guardar el nuevo
+                    deactivate_all(user_id)
                     programs_table.put_item(Item=item)
-                    print("[Handler] Programa guardado correctamente")
 
-                    return response(200, item)
+                    return resp(200, item)
 
-                print(f"[Handler] Ruta no encontrada: {method} {path}")
-                return response(404, {"error": "Not found"})
+                # ── GET /program/history ────────────────────────────────────
+                if method == "GET" and path.endswith("/program/history"):
+                    result = programs_table.query(
+                        KeyConditionExpression=Key("userId").eq(user_id)
+                    )
+                    items = result.get("Items", [])
+                    # Ordenar del más reciente al más antiguo
+                    items.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
+                    return resp(200, items)
+
+                # ── PUT /program/complete ───────────────────────────────────
+                # Body: { "programId": "...", "dayIndex": 0, "exerciseIndex": 2, "completed": true }
+                # Si exerciseIndex == -1  →  marcar/desmarcar día completo
+                if method == "PUT" and path.endswith("/program/complete"):
+                    body         = json.loads(event.get("body", "{}"))
+                    program_id   = body.get("programId")
+                    day_index    = body.get("dayIndex")
+                    ex_index     = body.get("exerciseIndex", -1)
+                    completed    = body.get("completed", True)
+
+                    if program_id is None or day_index is None:
+                        return resp(400, {"error": "Missing programId or dayIndex"})
+
+                    # Obtener el programa para recalcular score
+                    res_item = programs_table.get_item(
+                        Key={"userId": user_id, "programId": program_id}
+                    ).get("Item")
+                    if not res_item:
+                        return resp(404, {"error": "Program not found"})
+
+                    if ex_index == -1:
+                        # Marcar o desmarcar todos los ejercicios del día
+                        days = res_item.get("program", {}).get("days", [])
+                        completed_ex = dict(res_item.get("completedExercises", {}))
+                        if day_index < len(days):
+                            num_ex = len(days[day_index].get("exercises", []))
+                            for ei in range(num_ex):
+                                key_ex = f"{day_index}_{ei}"
+                                completed_ex[key_ex] = completed
+
+                        completed_days = dict(res_item.get("completedDays", {}))
+                        completed_days[str(day_index)] = completed
+
+                        res_item["completedExercises"] = completed_ex
+                        res_item["completedDays"]      = completed_days
+                        res_item["score"]              = calc_score(res_item)
+
+                        programs_table.update_item(
+                            Key={"userId": user_id, "programId": program_id},
+                            UpdateExpression="SET completedExercises = :ce, completedDays = :cd, score = :sc",
+                            ExpressionAttributeValues={
+                                ":ce": completed_ex,
+                                ":cd": completed_days,
+                                ":sc": res_item["score"]
+                            }
+                        )
+                    else:
+                        # Marcar ejercicio individual
+                        key_ex       = f"{day_index}_{ex_index}"
+                        completed_ex = dict(res_item.get("completedExercises", {}))
+                        completed_ex[key_ex] = completed
+
+                        # Recalcular si el día está completo
+                        days = res_item.get("program", {}).get("days", [])
+                        completed_days = dict(res_item.get("completedDays", {}))
+                        if day_index < len(days):
+                            num_ex   = len(days[day_index].get("exercises", []))
+                            day_done = all(completed_ex.get(f"{day_index}_{ei}", False) for ei in range(num_ex))
+                            completed_days[str(day_index)] = day_done
+
+                        res_item["completedExercises"] = completed_ex
+                        res_item["completedDays"]      = completed_days
+                        res_item["score"]              = calc_score(res_item)
+
+                        programs_table.update_item(
+                            Key={"userId": user_id, "programId": program_id},
+                            UpdateExpression="SET completedExercises = :ce, completedDays = :cd, score = :sc",
+                            ExpressionAttributeValues={
+                                ":ce": completed_ex,
+                                ":cd": completed_days,
+                                ":sc": res_item["score"]
+                            }
+                        )
+
+                    return resp(200, {"ok": True, "score": float(res_item["score"])})
+
+                return resp(404, {"error": "Not found"})
 
             except Exception as e:
-                print(f"[Handler] ERROR GENERAL: {str(e)}")
                 import traceback
-                print(f"[Handler] Traceback: {traceback.format_exc()}")
-                return response(500, {"error": "Internal error", "details": str(e)})
+                print(f"[Handler] ERROR: {str(e)}\n{traceback.format_exc()}")
+                return resp(500, {"error": "Internal error", "details": str(e)})
 
       Environment:
         Variables:
@@ -764,6 +831,18 @@ Resources:
             RestApiId: !Ref GymApi
             Path: /program/generate
             Method: POST
+        ProgramHistory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /program/history
+            Method: GET
+        ProgramComplete:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GymApi
+            Path: /program/complete
+            Method: PUT
 
   ########################
   # MEMBERSHIP Lambda
@@ -778,9 +857,16 @@ Resources:
         import boto3
         import os
         from datetime import datetime
+        from decimal import Decimal
 
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(os.environ["MEMBERSHIP_TABLE"])
+
+        class DecimalEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, Decimal):
+                    return float(obj)
+                return super().default(obj)
 
         def response(code, body):
             return {
@@ -842,7 +928,6 @@ Resources:
             Path: /membership
             Method: POST
 
-
   ########################
   # IAM ROLE para EventBridge Scheduler
   ########################
@@ -891,52 +976,37 @@ Resources:
                 class_id = event.get("classId")
                 class_name = event.get("className", "tu clase")
 
-                print(f"[Notifier] Notificando clase {class_id} - {class_name}")
-
-                # Obtener todos los inscritos en la clase
                 result = enrollments_table.query(
                     KeyConditionExpression=boto3.dynamodb.conditions.Key("classId").eq(class_id)
                 )
                 enrollments = result.get("Items", [])
-                print(f"[Notifier] Inscritos: {len(enrollments)}")
 
                 for enrollment in enrollments:
                     user_id = enrollment.get("userId")
                     user = users_table.get_item(Key={"userId": user_id}).get("Item")
 
                     if not user or not user.get("email"):
-                        print(f"[Notifier] Usuario {user_id} sin email, saltando")
                         continue
-
-                    email = user["email"]
-                    name = user.get("name", "")
 
                     try:
                         ses.send_email(
                             Source=os.environ["SES_SENDER"],
-                            Destination={"ToAddresses": [email]},
+                            Destination={"ToAddresses": [user["email"]]},
                             Message={
                                 "Subject": {"Data": f"Recordatorio: {class_name} empieza en 1 hora"},
                                 "Body": {"Text": {"Data": (
-                                    f"Hola {name}!
-
-        "
+                                    f"Hola {user.get('name', '')}!\n\n"
                                     f"Te recordamos que la clase '{class_name}' "
-                                    f"empieza en 1 hora.
-
-        "
-                                    f"Nos vemos pronto!"
+                                    f"empieza en 1 hora.\n\nNos vemos pronto!"
                                 )}}
                             }
                         )
-                        print(f"[Notifier] Email enviado a {email}")
                     except Exception as e:
-                        print(f"[Notifier] Error enviando a {email}: {str(e)}")
+                        print(f"[Notifier] Error enviando a {user['email']}: {str(e)}")
 
                 return {"ok": True, "notified": len(enrollments)}
 
             except Exception as e:
-                print(f"[Notifier] ERROR: {str(e)}")
                 return {"ok": False, "error": str(e)}
 
       Environment:
