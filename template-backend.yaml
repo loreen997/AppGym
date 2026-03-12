@@ -1246,7 +1246,7 @@ FaceAuthFunction:
 
   ########################
   # NOTIFIER Lambda
-  ########################
+  #########################
 
   NotifierFunction:
     Type: AWS::Serverless::Function
