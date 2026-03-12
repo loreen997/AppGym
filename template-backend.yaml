@@ -1244,7 +1244,7 @@ FaceAuthFunction:
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt NotifierFunction.Arn
 
-  ########################
+  #########################
   # NOTIFIER Lambda
   #########################
 
