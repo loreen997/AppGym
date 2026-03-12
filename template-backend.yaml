@@ -19,11 +19,19 @@ FacesBucket:
   Type: AWS::S3::Bucket
   Properties:
     BucketName: !Sub "gym-faces-${AWS::AccountId}"
+    OwnershipControls:
+      Rules:
+        - ObjectOwnership: BucketOwnerEnforced   # desactiva ACLs completamente
+    PublicAccessBlockConfiguration:
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
     LifecycleConfiguration:
       Rules:
         - Id: DeleteTempPhotos
           Status: Enabled
-          ExpirationInDays: 1   # las fotos se borran en 24h por privacidad
+          ExpirationInDays: 1
 
 # ── Custom Resource: crea la Rekognition Collection ─
 FacesCollectionCreator:
